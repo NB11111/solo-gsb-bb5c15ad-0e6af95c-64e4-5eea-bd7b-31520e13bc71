@@ -16,6 +16,10 @@
 之间的若干独立子段分别寻优，再合并为完整路径——锚点保证被采用，段内仍允许
 漏拍、插入拍与连续偏差。
 
+对已完成的任务还可提取**复核片段（review segments）**：指定**偏差阈值**与
+**可容忍的拍间隔**，把对齐结果中的漏拍、插入音及超阈值偏差按参考拍顺序聚合成
+若干片段，返回每个片段的**拍号范围**与**问题摘要**，供人工逐段复核。
+
 ## 目录结构
 
 ```
@@ -24,10 +28,12 @@
 │   ├── main.py          # FastAPI 路由
 │   ├── alignment.py     # 带宽约束 DTW 核心算法（纯标准库，含锚点分段对齐）
 │   ├── tempo.py         # 节奏曲线（tempo map）估计：中位数窗口 + 稳定区间压缩
+│   ├── review.py        # 复核片段提取：漏拍/插入音/超阈值偏差按参考拍聚合
 │   ├── schemas.py       # Pydantic 请求/响应模型
 │   ├── database.py      # SQLite 连接、建表与旧库迁移
 │   └── crud.py          # 任务读写
-├── tests/               # unittest 测试（对齐算法 18 个 + 节奏曲线 10 个 + 接口 20 个）
+├── tests/               # unittest 测试（对齐算法 18 个 + 节奏曲线 10 个
+│                        #   + 复核片段 14 个 + 接口 25 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -43,7 +49,19 @@ docker compose up --build
 - 交互式文档（Swagger UI）：<http://localhost:8000/docs>
 - 只读文档（ReDoc）：<http://localhost:8000/redoc>
 - 健康检查：`GET http://localhost:8000/health`
+- 复核片段接口示例：
+  `GET http://localhost:8000/jobs/1/review-segments?deviation_threshold=0.05&gap_tolerance_beats=2`
 - SQLite 数据文件：容器内 `/data/alignment.db`，由命名卷 `beat-data` 持久化
+
+配置（均通过环境变量，见 `docker-compose.yml`）：
+
+| 变量             | 默认值                  | 说明                           |
+| ---------------- | ----------------------- | ------------------------------ |
+| `ALIGN_DB_PATH`  | `/data/alignment.db`    | SQLite 数据库文件路径（目录自动创建） |
+
+如需改宿主机端口，编辑 `docker-compose.yml` 中 `ports` 的左侧值
+（例如 `"18000:8000"`）；数据库路径可改 `environment.ALIGN_DB_PATH` 并同步
+挂载的卷。
 
 停止：
 
@@ -76,6 +94,7 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 | GET    | `/jobs/{id}`               | 查询任务（含完整输入、锚点与结果）     |
 | GET    | `/jobs/{id}/result`        | 只查询对齐结果（含已采用锚点）         |
 | GET    | `/jobs/{id}/tempo-map`     | 从 matched_beats 导出节奏曲线（tempo events） |
+| GET    | `/jobs/{id}/review-segments` | 提取复核片段：漏拍/插入音/超阈值偏差按参考拍聚合（拍号范围 + 摘要） |
 | GET    | `/jobs`                    | 任务列表（摘要，按创建时间倒序）       |
 | GET    | `/health`                  | 健康检查                               |
 
@@ -151,7 +170,10 @@ curl -s http://localhost:8000/jobs/$ID/result
 # 4) 导出节奏曲线（可带窗口与 BPM 范围参数）
 curl -s "http://localhost:8000/jobs/$ID/tempo-map?window_beats=5&min_bpm=40&max_bpm=300"
 
-# 5) 列出全部任务
+# 5) 提取复核片段（偏差阈值 0.05s，问题相距不超过 2 拍则合并）
+curl -s "http://localhost:8000/jobs/$ID/review-segments?deviation_threshold=0.05&gap_tolerance_beats=2"
+
+# 6) 列出全部任务
 curl -s http://localhost:8000/jobs
 ```
 
@@ -288,6 +310,90 @@ print("插入拍:", [b["perf_index"] for b in result["inserted_beats"]])
 错误：任务不存在 `404`；任务尚未对齐 `409`；上次对齐失败 `400`；
 匹配拍不足 2 个 `409`；参数非法（越界或 `min_bpm >= max_bpm`）`422`。
 
+## 复核片段提取（`GET /jobs/{id}/review-segments`）
+
+对**已完成**的任务，按用户指定的**偏差阈值**与**可容忍的拍间隔**，把对齐
+结果中需要人工复核的三类问题按**参考拍顺序**聚合成复核片段，返回每个片段的
+**拍号范围**（1 基，便于对照乐谱 / DAW；同时给出 0 基参考索引）与**问题
+摘要**。该接口按需计算、只读，不修改 SQLite 中的对齐结果。
+
+查询参数：
+
+| 参数                    | 默认   | 说明                                                        |
+| ----------------------- | ------ | ----------------------------------------------------------- |
+| `deviation_threshold`   | `0.05` | 偏差阈值（秒）：匹配拍 `|偏差|` **严格大于**该值判为超阈值偏差（必须 > 0） |
+| `gap_tolerance_beats`   | `2.0`  | 可容忍的拍间隔：相邻问题的最近参考拍索引差 ≤ 该值时并入同一片段，否则另起（≥ 0，支持小数） |
+
+聚合规则：
+
+1. 三类问题统一为带“参考拍位置”的事件：
+   - **漏拍（missed）**：锚定在被漏的参考拍索引；
+   - **超阈值偏差（deviation）**：锚定在该匹配拍，按偏差符号标注抢拍 / 拖拍；
+   - **插入音（inserted）**：无对应参考拍，按其演奏时间在前后两个匹配拍之间
+     做线性内插，得到**分数参考位置**，片段跨度覆盖这两个匹配拍（位于所有
+     匹配拍之前 / 之后时退到最近的匹配拍）；
+2. 事件按参考拍位置排序，依次扫描：相邻事件的**最近边缘**参考拍索引差不超过
+   `gap_tolerance_beats` 时并入同一片段，否则另起一片段。例如两处问题分别在
+   第 2 拍与第 5 拍：差 3 拍，容差 2 时分裂为两个片段，容差 3 时合并；
+3. 每个片段输出：拍号 / 索引范围及两端参考时间、漏拍 / 插入音 / 超阈值偏差
+   （含抢 / 拖）计数、最大绝对偏差、逐问题明细 `issues`（含中文描述）与一段
+   中文 `summary`。没有问题时返回空片段列表（仍是 `200`）。
+
+响应示例（片段内含插入音、漏拍与连续拖拍）：
+
+```json
+{
+  "job_id": 7,
+  "parameters": {"deviation_threshold": 0.05, "gap_tolerance_beats": 2.0},
+  "segment_count": 1,
+  "total_missed_count": 1,
+  "total_inserted_count": 1,
+  "total_over_threshold_count": 3,
+  "segments": [
+    {
+      "segment_index": 0,
+      "ref_start_index": 1,
+      "ref_end_index": 5,
+      "beat_number_start": 2,
+      "beat_number_end": 6,
+      "ref_start_time": 0.5,
+      "ref_end_time": 2.5,
+      "missed_count": 1,
+      "inserted_count": 1,
+      "over_threshold_count": 3,
+      "early_count": 0,
+      "late_count": 3,
+      "issue_count": 5,
+      "max_abs_deviation": 0.06,
+      "summary": "漏拍 1 处，插入音 1 处，超阈值偏差 3 拍（拖拍 3），最大绝对偏差 0.060s；拍号范围 第 2–6 拍",
+      "issues": [
+        {"type": "inserted", "ref_index": null, "beat_number": null,
+         "perf_index": 3, "ref_time": null, "perf_time": 1.76,
+         "deviation": null, "status": null,
+         "description": "插入音：演奏音 #3（1.760s）位于参考第 3–4 拍之间，参考网格中无对应拍"},
+        {"type": "missed", "ref_index": 2, "beat_number": 3,
+         "perf_index": null, "ref_time": 1.0, "perf_time": null,
+         "deviation": null, "status": null,
+         "description": "漏拍：第 3 拍（参考时间 1.000s）未检测到对应的演奏音"},
+        {"type": "deviation", "ref_index": 3, "beat_number": 4,
+         "perf_index": 4, "ref_time": 1.5, "perf_time": 1.56,
+         "deviation": 0.06, "status": "late",
+         "description": "拖拍：第 4 拍偏差 +0.060s，超过阈值 ±0.050s"}
+      ]
+    }
+  ]
+}
+```
+
+- `beat_number_start` / `beat_number_end`：复核片段的 **1 基拍号范围**
+  （含端点），`ref_start_index` / `ref_end_index` 为对应的 0 基参考拍索引。
+  插入音没有单一拍号，其 `beat_number` 为 `null`，但会把所在区间扩展进片段范围。
+- 顶层 `total_*_count` 为全部片段的问题总数，便于在任务列表中快速统计。
+
+错误：任务不存在 `404`；任务尚未对齐或无对齐结果（`pending` / `result`
+缺失）返回 `409` 并提示先调用 `/jobs/{id}/align`；上次对齐失败 `400`；
+参数非法（阈值非正、可容忍间隔为负）`422`。
+
 ## 算法说明
 
 设参考拍 `r₀..rₙ₋₁`、演奏音 `p₀..pₘ₋₁`，代价矩阵单元
@@ -330,8 +436,10 @@ D(i,j) = min of  ⎨ D(i−1,j)   + skip_penalty          漏拍（水平）
   或锚点校验失败（索引为负 / 越界 / 非严格递增 / 超出带宽不可达），
   `detail` 中会给出具体锚点与原因
 - `404` 任务不存在
-- `409` 对尚未对齐（`pending`）的任务调用 `/result` 或 `/tempo-map`；
-  或 `/tempo-map` 的匹配拍不足 2 个
-- `400` `/tempo-map` 作用于上次对齐失败（`error`）的任务
+- `409` 对尚未对齐（`pending`）的任务调用 `/result`、`/tempo-map` 或
+  `/review-segments`；`/tempo-map` 的匹配拍不足 2 个；或任务无对齐结果
+  （`result` 缺失）时调用 `/review-segments`
+- `400` `/tempo-map` 或 `/review-segments` 作用于上次对齐失败（`error`）的任务
 - `422` 请求体校验失败（空序列、非递增、字段类型错误等），
-  或 `/tempo-map` 参数非法（`min_bpm >= max_bpm`、`window_beats` 越界）
+  或查询参数非法（`min_bpm >= max_bpm`、`window_beats` 越界、
+  `deviation_threshold ≤ 0`、`gap_tolerance_beats < 0`）

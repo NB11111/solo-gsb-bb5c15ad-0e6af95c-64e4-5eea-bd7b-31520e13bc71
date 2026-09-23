@@ -163,6 +163,62 @@ class TempoMapOut(BaseModel):
     )
 
 
+ReviewIssueType = Literal["missed", "inserted", "deviation"]
+
+
+class ReviewIssue(BaseModel):
+    type: ReviewIssueType = Field(
+        ..., description="问题类型：missed=漏拍，inserted=插入音，deviation=超阈值偏差"
+    )
+    ref_index: int | None = Field(
+        ..., description="关联的参考拍 0 基索引（插入音无对应参考拍，为 null）"
+    )
+    beat_number: int | None = Field(
+        ..., description="关联的 1 基拍号（插入音为 null）"
+    )
+    perf_index: int | None = Field(..., description="关联的演奏音 0 基索引（漏拍为 null）")
+    ref_time: float | None = Field(..., description="参考时间（秒）；插入音为 null")
+    perf_time: float | None = Field(..., description="演奏时间（秒）；漏拍为 null")
+    deviation: float | None = Field(
+        ..., description="偏差（秒，perf−ref）；仅超阈值偏差问题给出"
+    )
+    status: BeatStatus | None = Field(
+        ..., description="early/late；仅超阈值偏差问题给出"
+    )
+    description: str = Field(..., description="单问题的中文描述")
+
+
+class ReviewSegment(BaseModel):
+    segment_index: int
+    ref_start_index: int = Field(..., description="片段起始参考拍 0 基索引")
+    ref_end_index: int = Field(..., description="片段结束参考拍 0 基索引（含）")
+    beat_number_start: int = Field(..., description="片段起始拍号（1 基，含）")
+    beat_number_end: int = Field(..., description="片段结束拍号（1 基，含）")
+    ref_start_time: float | None
+    ref_end_time: float | None
+    missed_count: int
+    inserted_count: int
+    over_threshold_count: int = Field(..., description="超阈值偏差拍数")
+    early_count: int
+    late_count: int
+    issue_count: int
+    max_abs_deviation: float | None
+    summary: str = Field(..., description="问题摘要（中文）")
+    issues: list[ReviewIssue]
+
+
+class ReviewSegmentsOut(BaseModel):
+    job_id: int
+    parameters: dict[str, Any]
+    segment_count: int = Field(..., description="复核片段数量")
+    total_missed_count: int
+    total_inserted_count: int
+    total_over_threshold_count: int
+    segments: list[ReviewSegment] = Field(
+        default_factory=list, description="按参考拍顺序排列的复核片段"
+    )
+
+
 class JobSummary(BaseModel):
     id: int
     name: str | None
