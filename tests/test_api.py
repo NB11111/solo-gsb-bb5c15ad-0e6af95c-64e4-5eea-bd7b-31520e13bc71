@@ -435,6 +435,160 @@ class TestAPI(unittest.TestCase):
         r = self.client.get(f"/jobs/{job_id}/tempo-map?window_beats=102")
         self.assertEqual(r.status_code, 422)
 
+    # ---- 复核片段提取 GET /jobs/{id}/review-segments ----
+
+    def test_review_segments_full_flow(self):
+        # 漏第 3 拍(1.0)，第 4 拍拖拍 +0.05s
+        body = {
+            "name": "review-take",
+            "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0],
+            "performance_onsets": [0.0, 0.5, 1.55, 2.0],
+            "params": {"band_width": 2},
+        }
+        job_id = self._create_done_job(body)
+        r = self.client.get(f"/jobs/{job_id}/review-segments")
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["job_id"], job_id)
+        self.assertEqual(data["parameters"],
+                         {"deviation_threshold": 0.03, "gap_beats": 1.0})
+        self.assertEqual(data["ref_beat_count"], 5)
+        self.assertEqual(data["missed_count"], 1)
+        self.assertEqual(data["over_threshold_count"], 1)
+        self.assertEqual(data["late_count"], 1)
+        self.assertEqual(data["early_count"], 0)
+        self.assertEqual(len(data["segments"]), 1)
+        seg = data["segments"][0]
+        # 漏拍在索引 2（第 3 拍），偏差在索引 3（第 4 拍），默认容忍间隔内合并
+        self.assertEqual((seg["beat_start_no"], seg["beat_end_no"]), (3, 4))
+        self.assertEqual((seg["ref_start_index"], seg["ref_end_index"]), (2, 3))
+        self.assertEqual(seg["missed_count"], 1)
+        self.assertEqual(seg["over_threshold_count"], 1)
+        self.assertEqual(seg["inserted_count"], 0)
+        self.assertEqual(seg["issue_types"], ["missed", "over_threshold"])
+        types = [i["type"] for i in seg["issues"]]
+        self.assertEqual(types, ["missed", "over_threshold"])
+        self.assertIn("漏拍", seg["summary"])
+        self.assertIn("超阈值偏差", seg["summary"])
+
+    def test_review_segments_inserted_beat(self):
+        # 演奏在 0.75s 多一个音（参考 beat1=0.5 与 beat2=1.0 之间）
+        body = {
+            "reference_beats": [0.0, 0.5, 1.0, 1.5],
+            "performance_onsets": [0.0, 0.5, 0.75, 1.0, 1.5],
+            "params": {"band_width": 2},
+        }
+        job_id = self._create_done_job(body)
+        r = self.client.get(
+            f"/jobs/{job_id}/review-segments?deviation_threshold=0.03&gap_beats=2"
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["inserted_count"], 1)
+        seg = data["segments"][0]
+        self.assertEqual((seg["beat_start_no"], seg["beat_end_no"]), (2, 3))
+        self.assertEqual(seg["issues"][0]["type"], "inserted")
+        self.assertIsNone(seg["issues"][0]["beat_no"])
+        self.assertEqual(seg["issues"][0]["perf_index"], 2)
+
+    def test_review_segments_gap_beats_splits(self):
+        # 两处相距较远的漏拍（索引 1 与 4），不同容忍间隔 -> 片段数不同
+        body = {
+            "reference_beats": [0.5 * i for i in range(6)],
+            "performance_onsets": [0.0, 1.0, 1.5, 2.5],
+            "params": {"band_width": 3},
+            "anchors": [{"ref_index": 0, "perf_index": 0},
+                        {"ref_index": 5, "perf_index": 3}],
+        }
+        job_id = self._create_done_job(body)
+        missed = self.client.get(f"/jobs/{job_id}/result").json()["result"]["missed_beats"]
+        self.assertEqual([b["ref_index"] for b in missed], [1, 4])
+
+        r = self.client.get(f"/jobs/{job_id}/review-segments?gap_beats=1")
+        data = r.json()
+        self.assertEqual(len(data["segments"]), 2)
+        self.assertEqual(data["segment_count"], 2)
+
+        r = self.client.get(f"/jobs/{job_id}/review-segments?gap_beats=3")
+        data = r.json()
+        self.assertEqual(len(data["segments"]), 1)
+        self.assertEqual(
+            (data["segments"][0]["beat_start_no"],
+             data["segments"][0]["beat_end_no"]),
+            (2, 5),
+        )
+        self.assertEqual(data["segments"][0]["summary"].startswith("第 2–5 拍"), True)
+
+    def test_review_segments_clean_performance_empty(self):
+        job_id = self._create_done_job({
+            "reference_beats": [0.0, 0.5, 1.0],
+            "performance_onsets": [0.0, 0.5, 1.0],
+        })
+        r = self.client.get(f"/jobs/{job_id}/review-segments")
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertEqual(data["segments"], [])
+        self.assertEqual(data["segment_count"], 0)
+        self.assertEqual(data["issue_count"], 0)
+
+    def test_review_segments_error_states(self):
+        # 404：任务不存在
+        r = self.client.get("/jobs/999999/review-segments")
+        self.assertEqual(r.status_code, 404)
+
+        # 409：任务尚未对齐（无对齐结果时的明确错误）
+        r = self.client.post("/jobs", json={
+            "reference_beats": REF, "performance_onsets": PERF,
+        })
+        pending_id = r.json()["id"]
+        r = self.client.get(f"/jobs/{pending_id}/review-segments")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("尚未对齐", r.json()["detail"])
+
+        # 400：上次对齐失败
+        from app import crud, database
+        conn = database.connect()
+        try:
+            crud.save_error(conn, pending_id, "boom")
+        finally:
+            conn.close()
+        r = self.client.get(f"/jobs/{pending_id}/review-segments")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("boom", r.json()["detail"])
+
+        # 409：done 但 result 缺失（手工置空）
+        empty_id = self._create_done_job({
+            "reference_beats": [0.0, 1.0],
+            "performance_onsets": [0.0, 1.0],
+        })
+        conn = database.connect()
+        try:
+            conn.execute(
+                "UPDATE jobs SET result=NULL WHERE id=?", (empty_id,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        r = self.client.get(f"/jobs/{empty_id}/review-segments")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("缺少对齐结果", r.json()["detail"])
+
+    def test_review_segments_param_validation(self):
+        job_id = self._create_done_job({
+            "reference_beats": [0.0, 0.5, 1.0],
+            "performance_onsets": [0.0, 0.5, 1.0],
+        })
+        r = self.client.get(
+            f"/jobs/{job_id}/review-segments?deviation_threshold=0"
+        )
+        self.assertEqual(r.status_code, 422)
+        r = self.client.get(
+            f"/jobs/{job_id}/review-segments?deviation_threshold=-0.1"
+        )
+        self.assertEqual(r.status_code, 422)
+        r = self.client.get(f"/jobs/{job_id}/review-segments?gap_beats=-1")
+        self.assertEqual(r.status_code, 422)
+
 
 if __name__ == "__main__":
     unittest.main()

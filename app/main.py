@@ -19,7 +19,14 @@ from .alignment import (
     validate_anchors,
 )
 from .database import get_db, init_db
-from .schemas import JobCreate, JobOut, JobSummary, TempoMapOut
+from .review import ReviewError, extract_review_segments
+from .schemas import (
+    JobCreate,
+    JobOut,
+    JobSummary,
+    ReviewSegmentsOut,
+    TempoMapOut,
+)
 from .tempo import TempoMapError, build_tempo_map
 
 
@@ -31,12 +38,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多轨录音节拍对齐 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "提交参考节拍网格与演奏轨音符起始时间，服务使用带宽约束的动态时间规整"
         "（Sakoe-Chiba DTW）处理漏拍、抢拍与插入拍，回溯生成一一对应映射及"
         "连续偏差区间。创建任务时可选提供 anchors 锚点（参考拍索引、演奏音索引），"
         "锚点作为硬约束把 DTW 限制在相邻锚点之间分段寻优，合并为完整对齐路径。"
+        "对齐完成后可通过 /review-segments 按偏差阈值与可容忍拍间隔把漏拍、"
+        "插入音及超阈值偏差聚合成人工复核片段。"
     ),
     lifespan=lifespan,
 )
@@ -226,3 +235,65 @@ def get_job_tempo_map(
     except TempoMapError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return {"job_id": job_id, **tempo_map}
+
+
+@app.get(
+    "/jobs/{job_id}/review-segments",
+    response_model=ReviewSegmentsOut,
+    tags=["jobs"],
+)
+def get_job_review_segments(
+    job_id: int,
+    deviation_threshold: float = Query(
+        default=0.03, gt=0,
+        description="偏差阈值（秒）：|偏差| 严格大于该值的匹配拍列为超阈值偏差问题",
+    ),
+    gap_beats: float = Query(
+        default=1.0, ge=0,
+        description=(
+            "可容忍的拍间隔（拍数）：按参考拍顺序相邻的两个问题坐标差不超过该值时"
+            "聚入同一复核片段，否则断开另起一片段"
+        ),
+    ),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """从已完成任务的对齐结果提取人工复核片段。
+
+    将漏拍、插入音与超阈值偏差按参考拍顺序投影到统一的参考拍坐标，
+    再用 ``gap_beats`` 聚合成复核片段，返回各片段的拍号范围（1 基、含端点）
+    与问题摘要。没有任何问题时返回空 ``segments``。
+
+    - 任务不存在：404
+    - 任务尚未对齐：409（明确提示缺少对齐结果）
+    - 上次对齐失败：400
+    - 参数越界（``deviation_threshold <= 0``、``gap_beats < 0``）：422
+    """
+    job = crud.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+    if job["status"] == "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="任务尚未对齐，无对齐结果可供提取复核片段，请先调用 /jobs/{id}/align",
+        )
+    if job["status"] == "error":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"上次对齐失败：{job['error']}",
+        )
+    if not job["result"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="任务缺少对齐结果，无法提取复核片段",
+        )
+
+    try:
+        review = extract_review_segments(
+            job["result"],
+            job["reference_beats"],
+            deviation_threshold=deviation_threshold,
+            gap_beats=gap_beats,
+        )
+    except ReviewError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return {"job_id": job_id, **review}

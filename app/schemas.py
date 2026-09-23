@@ -129,6 +129,65 @@ class AlignmentResult(BaseModel):
     statistics: dict[str, Any]
 
 
+ReviewIssueType = Literal["missed", "inserted", "over_threshold"]
+ReviewIssueStatus = Literal["early", "late"]
+
+
+class ReviewIssue(BaseModel):
+    type: ReviewIssueType
+    beat_no: int | None = Field(
+        ..., description="对应参考拍的拍号（1 基）；插入音无单一对应拍，为 null"
+    )
+    ref_index: int | None = Field(..., description="参考拍 0 基索引；插入音为 null")
+    ref_time: float | None = Field(..., description="参考时间（秒）；插入音为 null")
+    perf_index: int | None = Field(..., description="演奏音 0 基索引；漏拍为 null")
+    perf_time: float | None = Field(..., description="演奏时间（秒）；漏拍为 null")
+    deviation: float | None = Field(
+        ..., description="偏差（秒，perf−ref）；仅超阈值偏差问题给出"
+    )
+    status: ReviewIssueStatus | None = Field(
+        ..., description="early=抢拍 / late=拖拍；仅超阈值偏差问题给出"
+    )
+    description: str = Field(..., description="问题的一句话中文描述")
+
+
+class ReviewSegment(BaseModel):
+    segment_index: int
+    beat_start_no: int = Field(..., description="片段起始拍号（1 基，含）")
+    beat_end_no: int = Field(..., description="片段结束拍号（1 基，含）")
+    ref_start_index: int = Field(..., description="片段起始参考拍 0 基索引")
+    ref_end_index: int = Field(..., description="片段结束参考拍 0 基索引（含）")
+    ref_start_time: float | None
+    ref_end_time: float | None
+    issue_count: int
+    missed_count: int
+    inserted_count: int
+    over_threshold_count: int
+    issue_types: list[ReviewIssueType] = Field(
+        ..., description="片段内出现的问题类型（按首次出现顺序）"
+    )
+    max_absolute_deviation: float = Field(
+        ..., description="片段内超阈值偏差的最大 |偏差|（秒），无偏差问题时为 0"
+    )
+    summary: str = Field(..., description="片段问题摘要（拍号范围 + 各类问题计数）")
+    issues: list[ReviewIssue] = Field(..., description="片段内按参考拍顺序排列的问题")
+
+
+class ReviewSegmentsOut(BaseModel):
+    job_id: int
+    parameters: dict[str, Any]
+    ref_beat_count: int = Field(..., description="参考拍总数")
+    segment_count: int
+    issue_count: int = Field(..., description="问题总数")
+    missed_count: int
+    inserted_count: int
+    over_threshold_count: int
+    early_count: int = Field(..., description="超阈值偏差中抢拍（early）的数量")
+    late_count: int = Field(..., description="超阈值偏差中拖拍（late）的数量")
+    max_absolute_deviation: float
+    segments: list[ReviewSegment]
+
+
 class TempoEvent(BaseModel):
     ref_start_index: int = Field(..., description="事件起拍：第一个匹配参考拍的 0 基索引")
     ref_end_index: int = Field(
